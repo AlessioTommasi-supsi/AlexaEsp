@@ -1,36 +1,28 @@
 /*
  * ESP32 Bridge per Alexa - Controllo Vocale Locale
  * 
- * Questo ESP32 fa da ponte tra Alexa e il tuo ESP originale
- * Utilizza FauxmoESP per emulare dispositivi Philips Hue
- * 
- * Setup:
- * 1. Installa libreria "fauxmoESP" in Arduino IDE
- * 2. Carica su ESP32
- * 3. Apri Serial Monitor (115200 baud)
- * 4. WiFi salvato automaticamente, comandi per gestire dispositivi
- * 5. "Alexa, scopri dispositivi"
+ * Architettura Modulare:
+ * - config.h: Configurazione centralizzata
+ * - device_manager.h/cpp: Gestione dispositivi
+ * - wifi_manager.h/cpp: Gestione WiFi con fix password
+ * - alexa_manager.h/cpp: Gestione Alexa
+ * - esp-bridge.ino: Orchestratore principale
  */
 
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <fauxmoESP.h>
 #include <Preferences.h>
+#include "config.h"
+#include "device_manager.h"
+#include "wifi_manager.h"
+#include "alexa_manager.h"
 
-// ===== CONFIGURAZIONE COSTANTI =====
-const char* ESP_ORIGINALE_IP = "192.168.178.164"; // IP del tuo ESP originale
-const int MAX_DEVICES = 100;                      // Massimo dispositivi supportati
-const int SERIAL_BAUD_RATE = 115200;             // Velocità comunicazione seriale
-const int WIFI_CONNECT_TIMEOUT = 20;             // Timeout connessione WiFi (secondi)
-const int WIFI_RETRY_TIMEOUT = 15;               // Timeout retry WiFi salvato (secondi)
-const int HTTP_TIMEOUT = 5000;                   // Timeout richieste HTTP (ms)
-const int FAUXMO_PORT = 80;                      // Porta per FauxmoESP
-const int SETUP_DELAY = 1000;                    // Delay iniziale setup
-const int LOOP_DELAY = 10;                       // Delay loop principale
-const int WIFI_SCAN_DELAY = 100;                 // Delay dopo scan WiFi
-const int SERIAL_INPUT_TIMEOUT = 30000;          // Timeout input seriale (30 sec)
+// ===== DEFINIZIONE VARIABILI GLOBALI EXTERN =====
+const char* ESP_ORIGINALE_IP = "192.168.178.164";
+const char* DEVICE_NAME = "ESP32-Bridge";
+const char* PREFERENCES_NAMESPACE = "esp-bridge";
 
-// Stati per macchina a stati
+// ===== STATI SISTEMA =====
 enum SerialState {
     IDLE,
     WAITING_WIFI_SELECTION,
@@ -41,84 +33,93 @@ enum SerialState {
     WAITING_RESET_CONFIRM
 };
 
-// Struttura per dispositivi dinamici
-struct Device {
-    String name;
-    int pin;
-    String customUrl;  // Se vuoto, usa pulsePin standard
-    bool useCustomUrl;
-};
-
-// Variabili globali
-fauxmoESP fauxmo;
+// ===== ISTANZE CLASSI =====
 Preferences preferences;
-bool wifiConnected = false;
-Device devices[MAX_DEVICES];
-int deviceCount = 0;
+fauxmoESP fauxmo;
+DeviceManager deviceManager(&preferences);
+WiFiManager wifiManager(&preferences);
+AlexaManager alexaManager(&fauxmo, &deviceManager);
 
-// Gestione input seriale non-blocking
+// ===== GESTIONE INPUT SERIALE =====
 SerialState currentState = IDLE;
 String inputBuffer = "";
 unsigned long inputStartTime = 0;
 String pendingDeviceName = "";
-int selectedWifiIndex = -1;
-String selectedWifiSSID = "";
 
+// ===== SETUP =====
 void setup() {
     Serial.begin(SERIAL_BAUD_RATE);
     delay(SETUP_DELAY);
-    Serial.println("\n🚀 ESP32 Bridge per Alexa - Avvio...");
-    Serial.println("=======================================");
     
-    // Inizializza preferences
-    preferences.begin("esp-bridge", false);
+    printWelcome();
+    initializeSystem();
     
-    // Carica dispositivi salvati
-    caricaDispositivi();
-    
-    // Tenta connessione WiFi salvato
-    if (tentaConnessioneSalvata()) {
-        wifiConnected = true;
-        inizializzaAlexa();
-        mostraMenuPrincipale();
+    if (wifiManager.connectToSaved()) {
+        if (deviceManager.getDeviceCount() > 0) {
+            alexaManager.initialize();
+        }
+        showMainMenu();
     } else {
-        // Se fallisce, configurazione interattiva
-        avviaConfigurazioneWiFi();
+        wifiManager.startConfiguration();
+        currentState = WAITING_WIFI_SELECTION;
     }
 }
 
+// ===== LOOP PRINCIPALE =====
 void loop() {
-    if (wifiConnected) {
-        fauxmo.handle();
+    // Gestione Alexa
+    alexaManager.handle();
+    
+    // Controllo connessione WiFi
+    wifiManager.checkConnection();
+    if (!wifiManager.isWiFiConnected()) {
+        if (wifiManager.autoReconnect() && deviceManager.getDeviceCount() > 0) {
+            alexaManager.restart();
+        }
     }
     
-    // Gestisce input seriale non-blocking
-    gestisciInputSeriale();
+    // Gestione input seriale
+    handleSerialInput();
     
     delay(LOOP_DELAY);
 }
 
-void gestisciInputSeriale() {
-    // Controlla timeout
+// ===== INIZIALIZZAZIONE =====
+void printWelcome() {
+    Serial.println("\n🚀 ESP32 Bridge per Alexa - Refactored");
+    Serial.println("========================================");
+    Serial.printf("🔧 Max dispositivi: %d\n", MAX_DEVICES);
+    Serial.printf("📡 Target ESP: %s\n", ESP_ORIGINALE_IP);
+    Serial.printf("🏗️  Architettura: Modulare OOP\n");
+}
+
+void initializeSystem() {
+    preferences.begin(PREFERENCES_NAMESPACE, false);
+    deviceManager.loadDevices();
+}
+
+// ===== GESTIONE INPUT SERIALE =====
+void handleSerialInput() {
+    // Timeout check
     if (currentState != IDLE && (millis() - inputStartTime) > SERIAL_INPUT_TIMEOUT) {
-        Serial.println("\n⏰ Timeout input. Ritorno al menu principale.");
+        Serial.println("\n⏰ Timeout. Ritorno al menu.");
         resetSerialState();
-        mostraMenuPrincipale();
+        showMainMenu();
         return;
     }
     
-    // Leggi input se disponibile
+    // Leggi carattere
     if (Serial.available()) {
         char c = Serial.read();
         
         if (c == '\n' || c == '\r') {
             if (inputBuffer.length() > 0) {
-                processaInput(inputBuffer);
+                processInput(inputBuffer);
                 inputBuffer = "";
             }
-        } else if (c >= 32 && c <= 126) { // Caratteri stampabili
+        } else if (c >= 32 && c <= 126) {
             inputBuffer += c;
-            if (inputBuffer.length() > 200) { // Limita lunghezza input
+            if (inputBuffer.length() > MAX_INPUT_LENGTH) {
                 inputBuffer = "";
                 Serial.println("❌ Input troppo lungo");
             }
@@ -126,36 +127,45 @@ void gestisciInputSeriale() {
     }
 }
 
-void processaInput(String input) {
+void processInput(String input) {
     input.trim();
     
     switch (currentState) {
         case IDLE:
-            gestisciComandoPrincipale(input);
+            handleMainCommand(input);
             break;
-            
         case WAITING_WIFI_SELECTION:
-            gestisciSelezioneWiFi(input);
+            if (wifiManager.handleNetworkSelection(input)) {
+                // Configurazione completata o annullata
+                resetSerialState();
+                showMainMenu();
+            } else {
+                // Aspetta password
+                currentState = WAITING_WIFI_PASSWORD;
+            }
             break;
-            
         case WAITING_WIFI_PASSWORD:
-            gestisciPasswordWiFi(input);
+            if (wifiManager.handlePasswordInput(input)) {
+                // Configurazione completata
+                if (wifiManager.isWiFiConnected() && deviceManager.getDeviceCount() > 0) {
+                    alexaManager.initialize();
+                }
+                resetSerialState();
+                showMainMenu();
+            }
+            // Altrimenti continua ad aspettare password
             break;
-            
         case WAITING_DEVICE_TYPE:
-            gestisciTipoDispositivo(input);
+            handleDeviceType(input);
             break;
-            
         case WAITING_DEVICE_PIN:
-            gestisciPinDispositivo(input);
+            handleDevicePin(input);
             break;
-            
         case WAITING_DEVICE_URL:
-            gestisciUrlDispositivo(input);
+            handleDeviceURL(input);
             break;
-            
         case WAITING_RESET_CONFIRM:
-            gestisciConfermaReset(input);
+            handleResetConfirm(input);
             break;
     }
 }
@@ -163,8 +173,6 @@ void processaInput(String input) {
 void resetSerialState() {
     currentState = IDLE;
     pendingDeviceName = "";
-    selectedWifiIndex = -1;
-    selectedWifiSSID = "";
     inputStartTime = 0;
 }
 
@@ -173,332 +181,261 @@ void startSerialInput(SerialState newState) {
     inputStartTime = millis();
 }
 
-bool tentaConnessioneSalvata() {
-    String ssid = preferences.getString("wifi_ssid", "");
-    String password = preferences.getString("wifi_pass", "");
+// ===== MENU PRINCIPALE =====
+void showMainMenu() {
+    resetSerialState();
     
-    if (ssid.length() == 0) {
-        Serial.println("💾 Nessun WiFi salvato");
-        return false;
-    }
-    
-    Serial.println("💾 Tentativo connessione WiFi salvato: " + ssid);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid.c_str(), password.c_str());
-    
-    int tentativi = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativi < WIFI_RETRY_TIMEOUT) {
-        delay(500);
-        Serial.print(".");
-        tentativi++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n✅ WiFi salvato connesso!");
-        Serial.printf("📍 IP: %s\n", WiFi.localIP().toString().c_str());
-        return true;
-    } else {
-        Serial.println("\n❌ Connessione WiFi salvato fallita");
-        return false;
-    }
+    Serial.println("\n╔═══════════════════════════════════════╗");
+    Serial.println("║      🏠 ESP32 BRIDGE ALEXA v2.0       ║");
+    Serial.println("╠═══════════════════════════════════════╣");
+    Serial.printf("║ WiFi: %-31s ║\n", wifiManager.isWiFiConnected() ? "✅ Connesso" : "❌ Disconnesso");
+    Serial.printf("║ Dispositivi: %2d/%-3d                  ║\n", deviceManager.getDeviceCount(), MAX_DEVICES);
+    Serial.printf("║ Alexa: %-30s ║\n", alexaManager.isAlexaInitialized() ? "✅ Attivo" : "❌ Non attivo");
+    Serial.println("╠═══════════════════════════════════════╣");
+    Serial.println("║  1. 📱 Mostra dispositivi             ║");
+    Serial.println("║  2. ➕ Aggiungi dispositivo           ║");
+    Serial.println("║  3. 🗑️  Rimuovi dispositivo            ║");
+    Serial.println("║  4. 📡 Configura WiFi                 ║");
+    Serial.println("║  5. 📊 Status sistema                 ║");
+    Serial.println("║  6. 🔄 Reset configurazione           ║");
+    Serial.println("║  7. 🎤 Riavvia Alexa                  ║");
+    Serial.println("║  0. 👋 Modalità silenziosa            ║");
+    Serial.println("╚═══════════════════════════════════════╝");
+    Serial.print("👉 Scegli opzione (0-7): ");
 }
 
-void salvaCredentialiWiFi(const String& ssid, const String& password) {
-    preferences.putString("wifi_ssid", ssid);
-    preferences.putString("wifi_pass", password);
-    Serial.println("💾 Credenziali WiFi salvate");
-}
-
-void caricaDispositivi() {
-    deviceCount = preferences.getInt("device_count", 0);
-    if (deviceCount > MAX_DEVICES) deviceCount = MAX_DEVICES; // Sicurezza
+void handleMainCommand(const String& input) {
+    int choice = input.toInt();
     
-    Serial.printf("💾 Caricati %d dispositivi salvati\n", deviceCount);
-    
-    for (int i = 0; i < deviceCount; i++) {
-        String nameKey = "dev_name_" + String(i);
-        String pinKey = "dev_pin_" + String(i);
-        String urlKey = "dev_url_" + String(i);
-        String customKey = "dev_custom_" + String(i);
-        
-        devices[i].name = preferences.getString(nameKey.c_str(), "");
-        devices[i].pin = preferences.getInt(pinKey.c_str(), 0);
-        devices[i].customUrl = preferences.getString(urlKey.c_str(), "");
-        devices[i].useCustomUrl = preferences.getBool(customKey.c_str(), false);
-        
-        if (devices[i].name.length() > 0) {
-            Serial.printf("   📱 %s -> %s\n", devices[i].name.c_str(), 
-                         devices[i].useCustomUrl ? devices[i].customUrl.c_str() : ("Pin " + String(devices[i].pin)).c_str());
-        }
-    }
-}
-
-void salvaDispositivi() {
-    preferences.putInt("device_count", deviceCount);
-    
-    for (int i = 0; i < deviceCount; i++) {
-        String nameKey = "dev_name_" + String(i);
-        String pinKey = "dev_pin_" + String(i);
-        String urlKey = "dev_url_" + String(i);
-        String customKey = "dev_custom_" + String(i);
-        
-        preferences.putString(nameKey.c_str(), devices[i].name);
-        preferences.putInt(pinKey.c_str(), devices[i].pin);
-        preferences.putString(urlKey.c_str(), devices[i].customUrl);
-        preferences.putBool(customKey.c_str(), devices[i].useCustomUrl);
-    }
-    Serial.println("💾 Dispositivi salvati");
-}
-
-void gestisciComandoPrincipale(const String& input) {
-    String cmd = input;
-    cmd.toLowerCase();
-    
-    if (cmd == "wifi") {
-        avviaConfigurazioneWiFi();
-    }
-    else if (cmd.startsWith("add ")) {
-        String nome = input.substring(4);
-        avviaAggiuntaDispositivo(nome);
-    }
-    else if (cmd == "list") {
-        mostraDispositivi();
-    }
-    else if (cmd.startsWith("remove ")) {
-        String nome = input.substring(7);
-        rimuoviDispositivo(nome);
-    }
-    else if (cmd == "help") {
-        mostraHelp();
-    }
-    else if (cmd == "reset") {
-        avviaResetConfigurazione();
-    }
-    else if (cmd == "status") {
-        mostraStatus();
-    }
-    else {
-        Serial.println("❌ Comando non riconosciuto. Scrivi 'help' per aiuto");
-    }
-}
-
-void avviaConfigurazioneWiFi() {
-    Serial.println("\n📡 Scansione reti WiFi disponibili...");
-    
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(WIFI_SCAN_DELAY);
-    
-    int reti = WiFi.scanNetworks();
-    
-    if (reti == 0) {
-        Serial.println("❌ Nessuna rete WiFi trovata!");
-        resetSerialState();
+    if (choice < MENU_MIN_OPTION || choice > MENU_MAX_OPTION - 1) {
+        Serial.println("❌ Opzione non valida! Scegli 0-7");
+        delay(MENU_RETURN_DELAY);
+        showMainMenu();
         return;
     }
     
-    Serial.println("\n📋 Reti WiFi disponibili:");
-    Serial.println("==========================");
-    
-    for (int i = 0; i < reti; i++) {
-        Serial.printf("%2d. %-25s", i + 1, WiFi.SSID(i).c_str());
-        
-        int rssi = WiFi.RSSI(i);
-        if (rssi > -50) Serial.print(" 📶📶📶📶");
-        else if (rssi > -60) Serial.print(" 📶📶📶");
-        else if (rssi > -70) Serial.print(" 📶📶");
-        else Serial.print(" 📶");
-        
-        if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) {
-            Serial.print(" 🔒");
-        } else {
-            Serial.print(" 🔓");
-        }
-        
-        Serial.printf(" (%d dBm)\n", rssi);
-    }
-    
-    Serial.println("\n🔢 Inserisci il numero della rete (1-" + String(reti) + ") o 'exit' per annullare:");
-    Serial.print("👉 ");
-    
-    startSerialInput(WAITING_WIFI_SELECTION);
-}
-
-void gestisciSelezioneWiFi(const String& input) {
-    if (input.equalsIgnoreCase("exit")) {
-        Serial.println("❌ Configurazione WiFi annullata");
-        resetSerialState();
-        mostraMenuPrincipale();
-        return;
-    }
-    
-    int numeroRete = input.toInt();
-    int reti = WiFi.scanNetworks(false, true); // Non async, mostra hidden
-    
-    if (numeroRete < 1 || numeroRete > reti) {
-        Serial.println("❌ Numero non valido! Riprova:");
-        Serial.print("👉 ");
-        return;
-    }
-    
-    selectedWifiIndex = numeroRete - 1;
-    selectedWifiSSID = WiFi.SSID(selectedWifiIndex);
-    Serial.println("✅ Rete selezionata: " + selectedWifiSSID);
-    
-    if (WiFi.encryptionType(selectedWifiIndex) != WIFI_AUTH_OPEN) {
-        Serial.println("\n🔐 Inserisci la password o 'exit' per annullare:");
-        Serial.print("👉 ");
-        startSerialInput(WAITING_WIFI_PASSWORD);
-    } else {
-        tentaConnessione(""); // Rete aperta
-    }
-    
-    WiFi.scanDelete();
-}
-
-void gestisciPasswordWiFi(const String& input) {
-    if (input.equalsIgnoreCase("exit")) {
-        Serial.println("❌ Configurazione WiFi annullata");
-        resetSerialState();
-        mostraMenuPrincipale();
-        return;
-    }
-    
-    Serial.println("✅ Password inserita");
-    tentaConnessione(input);
-}
-
-void tentaConnessione(const String& password) {
-    Serial.println("\n🔄 Connessione in corso...");
-    WiFi.begin(selectedWifiSSID.c_str(), password.c_str());
-    
-    int tentativi = 0;
-    while (WiFi.status() != WL_CONNECTED && tentativi < WIFI_CONNECT_TIMEOUT) {
-        delay(500);
-        Serial.print(".");
-        tentativi++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n✅ WiFi connesso!");
-        Serial.println("📍 SSID: " + WiFi.SSID());
-        Serial.printf("📍 IP: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("📍 Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
-        Serial.printf("📶 Intensità: %d dBm\n", WiFi.RSSI());
-        
-        wifiConnected = true;
-        salvaCredentialiWiFi(selectedWifiSSID, password);
-        
-        if (deviceCount > 0) {
-            inizializzaAlexa();
-        }
-        
-        resetSerialState();
-        mostraMenuPrincipale();
-    } else {
-        Serial.println("\n❌ Connessione fallita!");
-        Serial.println("💡 Verifica password e riprova");
-        resetSerialState();
-        mostraMenuPrincipale();
-    }
-}
-
-void avviaAggiuntaDispositivo(const String& nome) {
-    String nomeClean = nome;
-    nomeClean.trim();
-    
-    if (nomeClean.length() == 0) {
-        Serial.println("❌ Nome dispositivo vuoto");
-        return;
-    }
-    
-    if (deviceCount >= MAX_DEVICES) {
-        Serial.println("❌ Limite massimo dispositivi raggiunto (" + String(MAX_DEVICES) + ")");
-        return;
-    }
-    
-    // Controlla se esiste già
-    for (int i = 0; i < deviceCount; i++) {
-        if (devices[i].name.equalsIgnoreCase(nomeClean)) {
-            Serial.println("❌ Dispositivo già esistente");
+    switch (choice) {
+        case 1:
+            deviceManager.printDevices();
+            break;
+        case 2:
+            startAddDevice();
             return;
-        }
+        case 3:
+            startRemoveDevice();
+            return;
+        case 4:
+            wifiManager.startConfiguration();
+            currentState = WAITING_WIFI_SELECTION;
+            return;
+        case 5:
+            showSystemStatus();
+            break;
+        case 6:
+            startResetConfiguration();
+            return;
+        case 7:
+            restartAlexa();
+            break;
+        case 0:
+            Serial.println("👋 Modalità silenziosa. Digita qualsiasi numero per menu.");
+            return;
     }
     
-    pendingDeviceName = nomeClean;
-    Serial.println("\n➕ Aggiunta dispositivo: " + nomeClean);
-    Serial.println("🔧 Scegli tipo di controllo:");
-    Serial.println("   1. Standard (pulsePin con numero pin)");
-    Serial.println("   2. Custom (URL personalizzato)");
-    Serial.println("   exit. Annulla");
-    Serial.print("👉 Scegli (1/2/exit): ");
+    delay(MENU_RETURN_DELAY);
+    showMainMenu();
+}
+
+// ===== GESTIONE DISPOSITIVI =====
+void startAddDevice() {
+    if (deviceManager.isFull()) {
+        Serial.printf("❌ Limite massimo dispositivi raggiunto (%d)\n", MAX_DEVICES);
+        delay(MENU_RETURN_DELAY);
+        showMainMenu();
+        return;
+    }
     
+    Serial.println("\n➕ Inserisci nome del nuovo dispositivo:");
+    Serial.print("👉 ");
+    pendingDeviceName = "";
     startSerialInput(WAITING_DEVICE_TYPE);
 }
 
-void gestisciTipoDispositivo(const String& input) {
-    if (input.equalsIgnoreCase("exit")) {
-        Serial.println("❌ Aggiunta dispositivo annullata");
-        resetSerialState();
-        mostraMenuPrincipale();
+void startRemoveDevice() {
+    if (deviceManager.getDeviceCount() == 0) {
+        Serial.println("❌ Nessun dispositivo da rimuovere");
+        delay(MENU_RETURN_DELAY);
+        showMainMenu();
         return;
     }
     
-    if (input == "1") {
-        Serial.print("📍 Inserisci numero pin (es. 32) o 'exit': ");
-        startSerialInput(WAITING_DEVICE_PIN);
+    Serial.println("\n🗑️ Dispositivi disponibili:");
+    deviceManager.printDevices();
+    Serial.print("👉 Nome dispositivo da rimuovere: ");
+    
+    String deviceName = waitForSerialInput();
+    
+    if (deviceName.length() > 0) {
+        if (deviceManager.removeDevice(deviceName)) {
+            Serial.println("✅ Dispositivo '" + deviceName + "' rimosso");
+            if (wifiManager.isWiFiConnected()) {
+                alexaManager.restart();
+            }
+        } else {
+            Serial.println("❌ Dispositivo non trovato");
+        }
     }
-    else if (input == "2") {
-        Serial.print("🌐 Inserisci URL completo (es. http://192.168.1.100/action?cmd=open) o 'exit': ");
-        startSerialInput(WAITING_DEVICE_URL);
+    
+    delay(MENU_RETURN_DELAY);
+    showMainMenu();
+}
+
+String waitForSerialInput() {
+    String result = "";
+    unsigned long startTime = millis();
+    
+    while (millis() - startTime < SERIAL_INPUT_TIMEOUT) {
+        if (Serial.available()) {
+            result = Serial.readString();
+            result.trim();
+            break;
+        }
+        delay(10);
     }
-    else {
-        Serial.println("❌ Scelta non valida! Riprova (1/2/exit):");
-        Serial.print("👉 ");
+    
+    return result;
+}
+
+void restartAlexa() {
+    if (wifiManager.isWiFiConnected() && deviceManager.getDeviceCount() > 0) {
+        alexaManager.restart();
+    } else {
+        Serial.println("❌ WiFi non connesso o nessun dispositivo");
     }
 }
 
-void gestisciPinDispositivo(const String& input) {
-    if (input.equalsIgnoreCase("exit")) {
-        Serial.println("❌ Aggiunta dispositivo annullata");
+// ===== STATUS SISTEMA =====
+void showSystemStatus() {
+    Serial.println("\n📊 Status Sistema Modulare:");
+    Serial.println("==============================");
+    
+    // WiFi Status
+    Serial.printf("🌐 WiFi: %s\n", wifiManager.isWiFiConnected() ? "✅ Connesso" : "❌ Disconnesso");
+    if (wifiManager.isWiFiConnected()) {
+        Serial.printf("   SSID: %s\n", wifiManager.getSSID().c_str());
+        Serial.printf("   IP: %s\n", wifiManager.getIP().c_str());
+        Serial.printf("   RSSI: %d dBm\n", wifiManager.getRSSI());
+        Serial.printf("   MAC: %s\n", wifiManager.getMAC().c_str());
+    }
+    
+    // Alexa Status  
+    Serial.printf("🎤 Alexa: %s\n", alexaManager.isAlexaInitialized() ? "✅ Attivo" : "❌ Non attivo");
+    
+    // Device Status
+    Serial.printf("📱 Dispositivi: %d/%d\n", deviceManager.getDeviceCount(), MAX_DEVICES);
+    
+    // System Status
+    Serial.printf("💾 Memoria libera: %d KB\n", ESP.getFreeHeap() / 1024);
+    Serial.printf("⏱️  Uptime: %lu secondi\n", millis() / 1000);
+    Serial.printf("📡 Target ESP: %s\n", ESP_ORIGINALE_IP);
+    Serial.printf("🏗️  Architettura: Modulare OOP\n");
+}
+
+// ===== GESTIONE AGGIUNTA DISPOSITIVI =====
+void handleDeviceType(const String& input) {
+    // Se pendingDeviceName è vuoto, questo è il nome del dispositivo
+    if (pendingDeviceName.length() == 0) {
+        String name = input;
+        name.trim();
+        
+        if (name.length() == 0) {
+            Serial.println("❌ Nome vuoto! Riprova:");
+            Serial.print("👉 ");
+            return;
+        }
+        
+        if (name == "0") {
+            Serial.println("❌ Aggiunta annullata");
+            resetSerialState();
+            showMainMenu();
+            return;
+        }
+        
+        if (deviceManager.deviceExists(name)) {
+            Serial.println("❌ Dispositivo esistente! Riprova:");
+            Serial.print("👉 ");
+            return;
+        }
+        
+        pendingDeviceName = name;
+        Serial.println("✅ Nome: " + name);
+        Serial.println("🔧 Tipo controllo:");
+        Serial.println("   1. Standard (Pin ESP)");
+        Serial.println("   2. Custom (URL)");
+        Serial.println("   0. Annulla");
+        Serial.print("👉 Scegli (1/2/0): ");
+        return;
+    }
+    
+    // Gestione tipo dispositivo
+    int choice = input.toInt();
+    
+    switch (choice) {
+        case 0:
+            Serial.println("❌ Aggiunta annullata");
+            resetSerialState();
+            showMainMenu();
+            break;
+        case 1:
+            Serial.printf("📍 Pin ESP32 (%d-%d) o 0 per annullare: ", ESP32_MIN_PIN, ESP32_MAX_PIN);
+            startSerialInput(WAITING_DEVICE_PIN);
+            break;
+        case 2:
+            Serial.print("🌐 URL completo o 0 per annullare: ");
+            startSerialInput(WAITING_DEVICE_URL);
+            break;
+        default:
+            Serial.println("❌ Scelta non valida! Riprova (1/2/0):");
+            Serial.print("👉 ");
+            break;
+    }
+}
+
+void handleDevicePin(const String& input) {
+    if (input == "0") {
+        Serial.println("❌ Aggiunta annullata");
         resetSerialState();
-        mostraMenuPrincipale();
+        showMainMenu();
         return;
     }
     
     int pin = input.toInt();
-    if (pin <= 0 || pin > 39) { // ESP32 ha pin 0-39
-        Serial.println("❌ Pin non valido (1-39)! Riprova:");
+    if (pin < ESP32_MIN_PIN || pin > ESP32_MAX_PIN) {
+        Serial.printf("❌ Pin non valido (%d-%d)! Riprova:\n", ESP32_MIN_PIN, ESP32_MAX_PIN);
         Serial.print("👉 ");
         return;
     }
     
-    Device newDevice;
-    newDevice.name = pendingDeviceName;
-    newDevice.pin = pin;
-    newDevice.useCustomUrl = false;
-    newDevice.customUrl = "";
-    
-    devices[deviceCount] = newDevice;
-    deviceCount++;
-    
-    Serial.printf("✅ Dispositivo '%s' configurato per pin %d\n", pendingDeviceName.c_str(), pin);
-    
-    salvaDispositivi();
-    if (wifiConnected) {
-        Serial.println("🔄 Riavvio sistema Alexa...");
-        inizializzaAlexa();
+    if (deviceManager.addDevice(pendingDeviceName, pin)) {
+        Serial.printf("✅ '%s' configurato per pin %d\n", pendingDeviceName.c_str(), pin);
+        
+        if (wifiManager.isWiFiConnected()) {
+            alexaManager.restart();
+        }
+    } else {
+        Serial.println("❌ Errore aggiunta dispositivo");
     }
     
     resetSerialState();
-    mostraMenuPrincipale();
+    delay(MENU_RETURN_DELAY);
+    showMainMenu();
 }
 
-void gestisciUrlDispositivo(const String& input) {
-    if (input.equalsIgnoreCase("exit")) {
-        Serial.println("❌ Aggiunta dispositivo annullata");
+void handleDeviceURL(const String& input) {
+    if (input == "0") {
+        Serial.println("❌ Aggiunta annullata");
         resetSerialState();
-        mostraMenuPrincipale();
+        showMainMenu();
         return;
     }
     
@@ -511,229 +448,53 @@ void gestisciUrlDispositivo(const String& input) {
         return;
     }
     
-    Device newDevice;
-    newDevice.name = pendingDeviceName;
-    newDevice.customUrl = url;
-    newDevice.useCustomUrl = true;
-    newDevice.pin = 0;
-    
-    devices[deviceCount] = newDevice;
-    deviceCount++;
-    
-    Serial.printf("✅ Dispositivo '%s' configurato per URL: %s\n", pendingDeviceName.c_str(), url.c_str());
-    
-    salvaDispositivi();
-    if (wifiConnected) {
-        Serial.println("🔄 Riavvio sistema Alexa...");
-        inizializzaAlexa();
+    if (deviceManager.addDevice(pendingDeviceName, url)) {
+        Serial.printf("✅ '%s' configurato per URL: %s\n", pendingDeviceName.c_str(), url.c_str());
+        
+        if (wifiManager.isWiFiConnected()) {
+            alexaManager.restart();
+        }
+    } else {
+        Serial.println("❌ Errore aggiunta dispositivo");
     }
     
     resetSerialState();
-    mostraMenuPrincipale();
+    delay(MENU_RETURN_DELAY);
+    showMainMenu();
 }
 
-void rimuoviDispositivo(const String& nome) {
-    String nomeClean = nome;
-    nomeClean.trim();
-    bool trovato = false;
-    
-    for (int i = 0; i < deviceCount; i++) {
-        if (devices[i].name.equalsIgnoreCase(nomeClean)) {
-            // Sposta tutti gli elementi successivi indietro
-            for (int j = i; j < deviceCount - 1; j++) {
-                devices[j] = devices[j + 1];
-            }
-            deviceCount--;
-            trovato = true;
-            Serial.println("✅ Dispositivo '" + nomeClean + "' rimosso");
-            break;
-        }
-    }
-    
-    if (!trovato) {
-        Serial.println("❌ Dispositivo non trovato");
-        return;
-    }
-    
-    salvaDispositivi();
-    if (wifiConnected) {
-        Serial.println("🔄 Riavvio sistema Alexa...");
-        inizializzaAlexa();
-    }
-}
-
-void mostraDispositivi() {
-    Serial.println("\n📱 Dispositivi configurati:");
-    Serial.println("============================");
-    
-    if (deviceCount == 0) {
-        Serial.println("   Nessun dispositivo configurato");
-        Serial.println("   Usa 'add nome_dispositivo' per aggiungere");
-        return;
-    }
-    
-    for (int i = 0; i < deviceCount; i++) {
-        Serial.printf("%2d. %-20s -> ", i + 1, devices[i].name.c_str());
-        if (devices[i].useCustomUrl) {
-            Serial.println("🌐 " + devices[i].customUrl);
-        } else {
-            Serial.printf("📍 Pin %d (pulsePin)\n", devices[i].pin);
-        }
-    }
-    
-    Serial.printf("\nTotale: %d/%d dispositivi\n", deviceCount, MAX_DEVICES);
-}
-
-void mostraStatus() {
-    Serial.println("\n📊 Status Sistema:");
-    Serial.println("==================");
-    Serial.printf("WiFi: %s\n", wifiConnected ? "✅ Connesso" : "❌ Disconnesso");
-    if (wifiConnected) {
-        Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
-        Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
-    }
-    Serial.printf("Dispositivi: %d/%d\n", deviceCount, MAX_DEVICES);
-    Serial.printf("Memoria libera: %d KB\n", ESP.getFreeHeap() / 1024);
-    Serial.printf("Uptime: %lu secondi\n", millis() / 1000);
-}
-
-void mostraHelp() {
-    Serial.println("\n📖 Comandi disponibili:");
-    Serial.println("========================");
-    Serial.println("wifi                 - Riconfigura WiFi");
-    Serial.println("add nome_dispositivo - Aggiungi nuovo dispositivo");
-    Serial.println("remove nome          - Rimuovi dispositivo");
-    Serial.println("list                 - Mostra tutti i dispositivi");
-    Serial.println("status               - Mostra status sistema");
-    Serial.println("reset                - Reset completo configurazione");
-    Serial.println("help                 - Mostra questo aiuto");
-    Serial.println("\n📱 Comandi Alexa:");
-    Serial.println("'Alexa, scopri dispositivi'");
-    Serial.println("'Alexa, accendi [nome_dispositivo]'");
-    Serial.println("\n💡 Nota: timeout input 30 secondi, 'exit' per annullare");
-}
-
-void mostraMenuPrincipale() {
-    Serial.println("\n🏠 ESP32 Bridge - Menu Principale");
-    Serial.println("=================================");
-    Serial.println("Scrivi un comando o 'help' per aiuto");
+// ===== RESET CONFIGURAZIONE =====
+void startResetConfiguration() {
+    Serial.println("⚠️  RESET COMPLETO CONFIGURAZIONE!");
+    Serial.println("Verranno cancellati WiFi e tutti i dispositivi.");
+    Serial.println("Confermi? (y/N/0=annulla):");
     Serial.print("👉 ");
-}
-
-void avviaResetConfigurazione() {
-    Serial.println("⚠️  RESET completo configurazione!");
-    Serial.println("Questo cancellerà WiFi e tutti i dispositivi.");
-    Serial.print("Confermi? (y/N/exit): ");
     startSerialInput(WAITING_RESET_CONFIRM);
 }
 
-void gestisciConfermaReset(const String& input) {
-    if (input.equalsIgnoreCase("y")) {
+void handleResetConfirm(const String& input) {
+    String choice = input;
+    choice.toLowerCase();
+    
+    if (choice == "y" || choice == "yes") {
+        Serial.println("🔄 Reset in corso...");
+        
+        // Reset completo modularizzato
+        alexaManager.shutdown();
+        wifiManager.disconnect();
         preferences.clear();
-        deviceCount = 0;
-        WiFi.disconnect();
-        wifiConnected = false;
-        Serial.println("✅ Reset completato");
+        deviceManager.clear();
+        
+        Serial.println("✅ Reset completato!");
         Serial.println("🔄 Riavvia ESP per riconfigurare");
+        
         resetSerialState();
+        Serial.println("👋 Sistema in modalità silenziosa.");
+        return;
     } else {
         Serial.println("❌ Reset annullato");
         resetSerialState();
-        mostraMenuPrincipale();
+        delay(MENU_RETURN_DELAY);
+        showMainMenu();
     }
-}
-
-void inizializzaAlexa() {
-    Serial.println("\n🎤 Inizializzazione Alexa...");
-    
-    // Rimuovi tutti i dispositivi esistenti
-    fauxmo.enable(false);
-    delay(100);
-    
-    // Configurazione FauxmoESP per Alexa
-    fauxmo.createServer(true);
-    fauxmo.setPort(FAUXMO_PORT);
-    fauxmo.enable(true);
-    
-    // Aggiungi dispositivi dinamici
-    for (int i = 0; i < deviceCount; i++) {
-        fauxmo.addDevice(devices[i].name.c_str());
-        Serial.printf("   ➕ %s\n", devices[i].name.c_str());
-    }
-    
-    // Gestione comandi Alexa
-    fauxmo.onSetState([](unsigned char device_id, const char* device_name, bool state, unsigned char value) {
-        Serial.printf("🗣️ Alexa: '%s' -> %s\n", device_name, state ? "ON" : "OFF");
-        
-        if (state) { // Solo quando Alexa dice "accendi"
-            // Trova il dispositivo
-            for (int i = 0; i < deviceCount; i++) {
-                if (devices[i].name.equalsIgnoreCase(device_name)) {
-                    if (devices[i].useCustomUrl) {
-                        chiamaURLCustom(devices[i].customUrl);
-                    } else {
-                        chiamaESPOriginale(devices[i].pin);
-                    }
-                    break;
-                }
-            }
-        }
-    });
-    
-    Serial.println("\n🎉 ESP Bridge pronto!");
-    Serial.println("=====================");
-    Serial.printf("📱 %d dispositivi configurati\n", deviceCount);
-    Serial.println("📱 Comandi disponibili:");
-    Serial.println("   - 'Alexa, scopri dispositivi'");
-    for (int i = 0; i < deviceCount && i < 3; i++) {
-        Serial.println("   - 'Alexa, accendi " + devices[i].name + "'");
-    }
-    if (deviceCount > 3) {
-        Serial.println("   - ... e altri " + String(deviceCount - 3) + " dispositivi");
-    }
-    Serial.println("\n🌐 ESP Bridge online su: " + WiFi.localIP().toString());
-}
-
-// Funzione per chiamare l'API del tuo ESP originale (standard)
-void chiamaESPOriginale(int pin) {
-    HTTPClient http;
-    String url = "http://" + String(ESP_ORIGINALE_IP) + "/pulsePin?pin=" + String(pin);
-    
-    Serial.printf("📡 Chiamata ESP: %s\n", url.c_str());
-    
-    http.begin(url);
-    http.setTimeout(HTTP_TIMEOUT);
-    int httpCode = http.GET();
-    
-    if (httpCode == 200) {
-        Serial.printf("✅ Pin %d attivato con successo\n", pin);
-    } else {
-        Serial.printf("❌ Errore chiamata ESP (codice: %d)\n", httpCode);
-    }
-    
-    http.end();
-}
-
-// Funzione per chiamare URL custom
-void chiamaURLCustom(const String& url) {
-    HTTPClient http;
-    
-    Serial.printf("📡 Chiamata Custom: %s\n", url.c_str());
-    
-    http.begin(url);
-    http.setTimeout(HTTP_TIMEOUT);
-    int httpCode = http.GET();
-    
-    if (httpCode == 200) {
-        String response = http.getString();
-        Serial.println("✅ Richiesta custom eseguita");
-        if (response.length() > 0 && response.length() < 200) {
-            Serial.println("📥 Risposta: " + response);
-        }
-    } else {
-        Serial.printf("❌ Errore chiamata custom (codice: %d)\n", httpCode);
-    }
-    
-    http.end();
 }
