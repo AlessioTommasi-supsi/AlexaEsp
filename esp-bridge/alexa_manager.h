@@ -12,35 +12,38 @@ private:
     DeviceManager* deviceManager;
     bool isInitialized;
     
-    // Callback functions
+    // 🔒 SAFETY: Variabili per protezione callback
+    static volatile bool callbackSafe;
+    static AlexaManager* safeInstance;
+    
+    // Callback functions con protezione
     static void onDeviceStateChanged(unsigned char device_id, const char* device_name, bool state, unsigned char value);
+    
+    // Metodi privati
+    void addDevices();
+    void saveGeneratedUUID(int deviceIndex, unsigned char fauxmoDeviceId);
+    void handleDeviceCommand(const char* device_name, bool state);
+    void callESP(int pin);
+    void callCustomURL(const String& url);
+    void printStatus();
+    
+    // 🛡️ SAFETY: Metodi di sicurezza
+    void enableCallbacks();
+    void disableCallbacks();
+    bool isCallbackSafe() const;
     
 public:
     AlexaManager(fauxmoESP* fauxmoInstance, DeviceManager* devManager);
+    ~AlexaManager(); // Aggiunto destructor
     
     // Inizializzazione Alexa
     bool initialize();
     void shutdown();
     bool restart();
     
-    // Gestione dispositivi Alexa
-    void addDevices();
-    void handleDeviceCommand(const char* device_name, bool state);
-    
     // Stato
     bool isAlexaInitialized() const { return isInitialized; }
     void handle();
-    
-    // Chiamate HTTP
-    static void callESP(int pin);
-    static void callCustomURL(const String& url);
-    
-    // Info
-    void printStatus();
 };
-
-// Riferimenti globali per callback static
-extern AlexaManager* globalAlexaManager;
-extern DeviceManager* globalDeviceManager;
 
 #endif

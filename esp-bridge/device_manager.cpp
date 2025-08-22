@@ -64,43 +64,34 @@ Device* DeviceManager::findDevice(const String& name) {
 
 void DeviceManager::loadDevices() {
     deviceCount = preferences->getInt("device_count", 0);
-    if (deviceCount > MAX_DEVICES) deviceCount = MAX_DEVICES;
     
-    Serial.printf("💾 Caricati %d dispositivi salvati\n", deviceCount);
-    
-    for (int i = 0; i < deviceCount; i++) {
-        String nameKey = "dev_name_" + String(i);
-        String pinKey = "dev_pin_" + String(i);
-        String urlKey = "dev_url_" + String(i);
-        String customKey = "dev_custom_" + String(i);
+    for (int i = 0; i < deviceCount && i < MAX_DEVICES; i++) {
+        String prefix = "dev" + String(i) + "_";
         
-        devices[i].name = preferences->getString(nameKey.c_str(), "");
-        devices[i].pin = preferences->getInt(pinKey.c_str(), 0);
-        devices[i].customUrl = preferences->getString(urlKey.c_str(), "");
-        devices[i].useCustomUrl = preferences->getBool(customKey.c_str(), false);
-        
-        if (devices[i].name.length() > 0) {
-            Serial.printf("   📱 %s -> %s\n", devices[i].name.c_str(), 
-                         devices[i].useCustomUrl ? devices[i].customUrl.c_str() : ("Pin " + String(devices[i].pin)).c_str());
-        }
+        devices[i].name = preferences->getString((prefix + "name").c_str(), "");
+        devices[i].pin = preferences->getInt((prefix + "pin").c_str(), -1);
+        devices[i].useCustomUrl = preferences->getBool((prefix + "custom").c_str(), false);
+        devices[i].customUrl = preferences->getString((prefix + "url").c_str(), "");
+        devices[i].uuid = preferences->getString((prefix + "uuid").c_str(), "");  // NUOVO: Carica UUID salvato
     }
+    
+    Serial.printf("💾 Caricati %d dispositivi\n", deviceCount);
 }
 
 void DeviceManager::saveDevices() {
     preferences->putInt("device_count", deviceCount);
     
     for (int i = 0; i < deviceCount; i++) {
-        String nameKey = "dev_name_" + String(i);
-        String pinKey = "dev_pin_" + String(i);
-        String urlKey = "dev_url_" + String(i);
-        String customKey = "dev_custom_" + String(i);
+        String prefix = "dev" + String(i) + "_";
         
-        preferences->putString(nameKey.c_str(), devices[i].name);
-        preferences->putInt(pinKey.c_str(), devices[i].pin);
-        preferences->putString(urlKey.c_str(), devices[i].customUrl);
-        preferences->putBool(customKey.c_str(), devices[i].useCustomUrl);
+        preferences->putString((prefix + "name").c_str(), devices[i].name);
+        preferences->putInt((prefix + "pin").c_str(), devices[i].pin);
+        preferences->putBool((prefix + "custom").c_str(), devices[i].useCustomUrl);
+        preferences->putString((prefix + "url").c_str(), devices[i].customUrl);
+        preferences->putString((prefix + "uuid").c_str(), devices[i].uuid);  // NUOVO: Salva UUID
     }
-    Serial.println("💾 Dispositivi salvati");
+    
+    Serial.printf("💾 Salvati %d dispositivi con UUID\n", deviceCount);
 }
 
 void DeviceManager::printDevices() {

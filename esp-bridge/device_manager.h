@@ -9,10 +9,13 @@
 struct Device {
     String name;
     int pin;
-    String customUrl;
     bool useCustomUrl;
+    String customUrl;
+    String uuid;  // NUOVO: UUID persistente
     
-    Device() : pin(0), useCustomUrl(false) {}
+    Device() : pin(-1), useCustomUrl(false) {}
+    Device(const String& n, int p) : name(n), pin(p), useCustomUrl(false) {}
+    Device(const String& n, const String& url) : name(n), pin(-1), useCustomUrl(true), customUrl(url) {}
 };
 
 class DeviceManager {
