@@ -15,7 +15,11 @@ const int MAX_UNIQUE_ID_LENGTH = 26;                // Lunghezza max UID FauxmoE
 
 // ===== CONFIGURAZIONE SERIALE =====
 const int SERIAL_BAUD_RATE = 115200;                // Velocità comunicazione seriale
-const int SERIAL_INPUT_TIMEOUT = 30000;             // Timeout input seriale (30 sec)
+
+// 🚫 RIMOSSI I TIMEOUT - Ora usiamo await seriale pulito
+// const int SERIAL_INPUT_TIMEOUT = 120000;         // RIMOSSO
+// const int WIFI_SELECTION_TIMEOUT = 180000;       // RIMOSSO  
+// const int DEVICE_CONFIG_TIMEOUT = 60000;         // RIMOSSO
 
 // ===== CONFIGURAZIONE WIFI =====
 const int WIFI_CONNECT_TIMEOUT = 20;                // Timeout connessione WiFi (secondi)

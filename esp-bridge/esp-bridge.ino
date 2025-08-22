@@ -30,7 +30,8 @@ enum SerialState {
     WAITING_DEVICE_TYPE,
     WAITING_DEVICE_PIN,
     WAITING_DEVICE_URL,
-    WAITING_RESET_CONFIRM
+    WAITING_RESET_CONFIRM,
+    WAITING_DEVICE_REMOVE
 };
 
 // ===== ISTANZE CLASSI =====
@@ -43,7 +44,6 @@ AlexaManager alexaManager(&fauxmo, &deviceManager);
 // ===== GESTIONE INPUT SERIALE =====
 SerialState currentState = IDLE;
 String inputBuffer = "";
-unsigned long inputStartTime = 0;
 String pendingDeviceName = "";
 
 // ===== SETUP =====
@@ -100,15 +100,7 @@ void initializeSystem() {
 
 // ===== GESTIONE INPUT SERIALE =====
 void handleSerialInput() {
-    // Timeout check
-    if (currentState != IDLE && (millis() - inputStartTime) > SERIAL_INPUT_TIMEOUT) {
-        Serial.println("\n⏰ Timeout. Ritorno al menu.");
-        resetSerialState();
-        showMainMenu();
-        return;
-    }
-    
-    // Leggi carattere
+    // ✅ NUOVO: Gestione input seriale senza timeout - await pulito
     if (Serial.available()) {
         char c = Serial.read();
         
@@ -122,6 +114,10 @@ void handleSerialInput() {
             if (inputBuffer.length() > MAX_INPUT_LENGTH) {
                 inputBuffer = "";
                 Serial.println("❌ Input troppo lungo");
+                // Rimani nello stesso stato, non tornare al menu
+                if (currentState != IDLE) {
+                    Serial.print("👉 ");
+                }
             }
         }
     }
@@ -167,18 +163,19 @@ void processInput(String input) {
         case WAITING_RESET_CONFIRM:
             handleResetConfirm(input);
             break;
+        case WAITING_DEVICE_REMOVE:
+            handleDeviceRemove(input);
+            break;
     }
 }
 
 void resetSerialState() {
     currentState = IDLE;
     pendingDeviceName = "";
-    inputStartTime = 0;
 }
 
 void startSerialInput(SerialState newState) {
     currentState = newState;
-    inputStartTime = millis();
 }
 
 // ===== MENU PRINCIPALE =====
@@ -271,9 +268,22 @@ void startRemoveDevice() {
     
     Serial.println("\n🗑️ Dispositivi disponibili:");
     deviceManager.printDevices();
-    Serial.print("👉 Nome dispositivo da rimuovere: ");
+    Serial.print("👉 Nome dispositivo da rimuovere (0=annulla): ");
     
-    String deviceName = waitForSerialInput();
+    // ✅ NUOVO: Usa stato seriale invece di waitForSerialInput()
+    startSerialInput(WAITING_DEVICE_REMOVE);
+}
+
+void handleDeviceRemove(const String& input) {
+    String deviceName = input;
+    deviceName.trim();
+    
+    if (deviceName == "0") {
+        Serial.println("❌ Rimozione annullata");
+        resetSerialState();
+        showMainMenu();
+        return;
+    }
     
     if (deviceName.length() > 0) {
         if (deviceManager.removeDevice(deviceName)) {
@@ -288,30 +298,6 @@ void startRemoveDevice() {
     
     delay(MENU_RETURN_DELAY);
     showMainMenu();
-}
-
-String waitForSerialInput() {
-    String result = "";
-    unsigned long startTime = millis();
-    
-    while (millis() - startTime < SERIAL_INPUT_TIMEOUT) {
-        if (Serial.available()) {
-            result = Serial.readString();
-            result.trim();
-            break;
-        }
-        delay(10);
-    }
-    
-    return result;
-}
-
-void restartAlexa() {
-    if (wifiManager.isWiFiConnected() && deviceManager.getDeviceCount() > 0) {
-        alexaManager.restart();
-    } else {
-        Serial.println("❌ WiFi non connesso o nessun dispositivo");
-    }
 }
 
 // ===== STATUS SISTEMA =====
@@ -496,5 +482,14 @@ void handleResetConfirm(const String& input) {
         resetSerialState();
         delay(MENU_RETURN_DELAY);
         showMainMenu();
+    }
+}
+
+void restartAlexa() {
+    if (wifiManager.isWiFiConnected() && deviceManager.getDeviceCount() > 0) {
+        alexaManager.restart();
+        Serial.println("✅ Alexa riavviato");
+    } else {
+        Serial.println("❌ WiFi non connesso o nessun dispositivo");
     }
 }
