@@ -1,106 +1,128 @@
 /*
- * ESP32 Bridge per Alexa - Controllo Vocale Locale
+ * ESP32 Bridge per Alexa - Architettura MVC Completa
  * 
- * Architettura Modulare:
- * - config.h: Configurazione centralizzata
- * - device_manager.h/cpp: Gestione dispositivi
- * - wifi_manager.h/cpp: Gestione WiFi con fix password
- * - alexa_manager.h/cpp: Gestione Alexa
- * - esp-bridge.ino: Orchestratore principale
+ * Refactor completato:
+ * - Rimossi tutti i file obsoleti (device_manager, wifi_manager, alexa_manager, config.h)
+ * - Implementata architettura MVC pura con logica interna nei controller
+ * - Pattern: MVC, Singleton, Dependency Injection, Observer, Strategy
+ * 
+ * Struttura finale:
+ * - Model: SystemConfig (Singleton per configurazioni)
+ * - View: SerialController (tutte le stampe centralizzate)
+ * - Controller: DeviceController, WiFiController, AlexaController (logica completa interna)
  */
 
 #include <WiFi.h>
 #include <fauxmoESP.h>
 #include <Preferences.h>
-#include "config.h"
-#include "device_manager.h"
-#include "wifi_manager.h"
-#include "alexa_manager.h"
 
-// ===== DEFINIZIONE VARIABILI GLOBALI EXTERN =====
-const char* ESP_ORIGINALE_IP = "192.168.178.164";
-const char* DEVICE_NAME = "ESP32-Bridge";
-const char* PREFERENCES_NAMESPACE = "esp-bridge";
+// Include dell'architettura MVC completa
+#include "src/model/SystemConfig.h"
+#include "src/view/SerialController.h"
+#include "src/controller/DeviceController.h"
+#include "src/controller/WiFiController.h"
+#include "src/controller/AlexaController.h"
 
-// ===== STATI SISTEMA =====
+// ===== SYSTEM COMPONENTS =====
+Preferences preferences;
+fauxmoESP fauxmo;
+
+// ===== MVC COMPONENTS =====
+SerialController* serialController;
+DeviceController* deviceController;
+WiFiController* wifiController;
+AlexaController* alexaController;
+
+// ===== SERIAL INPUT STATE MACHINE =====
 enum SerialState {
     IDLE,
     WAITING_WIFI_SELECTION,
     WAITING_WIFI_PASSWORD,
+    WAITING_DEVICE_NAME,
     WAITING_DEVICE_TYPE,
     WAITING_DEVICE_PIN,
     WAITING_DEVICE_URL,
-    WAITING_RESET_CONFIRM,
-    WAITING_DEVICE_REMOVE
+    WAITING_DEVICE_REMOVE,
+    WAITING_RESET_CONFIRM
 };
 
-// ===== ISTANZE CLASSI =====
-Preferences preferences;
-fauxmoESP fauxmo;
-DeviceManager deviceManager(&preferences);
-WiFiManager wifiManager(&preferences);
-AlexaManager alexaManager(&fauxmo, &deviceManager);
-
-// ===== GESTIONE INPUT SERIALE =====
 SerialState currentState = IDLE;
 String inputBuffer = "";
 String pendingDeviceName = "";
 
-// ===== SETUP =====
+// ===== FORWARD DECLARATIONS =====
+void handleSerialInput();
+void processInput(const String& input);
+void showMainMenu();
+void handleMainCommand(const String& input);
+void handleDeviceAdd();
+void handleDeviceRemove();
+void handleReset();
+
+// ===== SYSTEM SETUP =====
 void setup() {
-    Serial.begin(SERIAL_BAUD_RATE);
-    delay(SETUP_DELAY);
+    SystemConfig* config = SystemConfig::getInstance();
     
-    printWelcome();
-    initializeSystem();
+    Serial.begin(config->SERIAL_BAUD_RATE);
+    delay(config->SETUP_DELAY);
     
-    if (wifiManager.connectToSaved()) {
-        if (deviceManager.getDeviceCount() > 0) {
-            alexaManager.initialize();
+    // Initialize preferences
+    preferences.begin(config->PREFERENCES_NAMESPACE, false);
+    
+    // Create MVC components with dependency injection
+    serialController = new SerialController();
+    deviceController = new DeviceController(&preferences, serialController);
+    wifiController = new WiFiController(&preferences, serialController);
+    alexaController = new AlexaController(&fauxmo, deviceController, serialController);
+    
+    // Initialize system
+    serialController->printWelcome();
+    
+    deviceController->initialize();
+    wifiController->initialize();
+    
+    // Auto-connect and start services
+    if (wifiController->connectToSaved()) {
+        if (deviceController->getDeviceCount() > 0) {
+            alexaController->initialize();
         }
         showMainMenu();
     } else {
-        wifiManager.startConfiguration();
+        wifiController->startConfiguration();
         currentState = WAITING_WIFI_SELECTION;
     }
 }
 
-// ===== LOOP PRINCIPALE =====
+// ===== MAIN LOOP =====
 void loop() {
-    // Gestione Alexa
-    alexaManager.handle();
+    // Handle all subsystems
+    alexaController->handle();
+    wifiController->checkConnection();
+    handleSerialInput();
     
-    // Controllo connessione WiFi
-    wifiManager.checkConnection();
-    if (!wifiManager.isWiFiConnected()) {
-        if (wifiManager.autoReconnect() && deviceManager.getDeviceCount() > 0) {
-            alexaManager.restart();
+    // Auto-reconnect logic
+    if (!wifiController->isWiFiConnected()) {
+        if (wifiController->autoReconnect() && deviceController->getDeviceCount() > 0) {
+            alexaController->restart();
         }
     }
     
-    // Gestione input seriale
-    handleSerialInput();
+    delay(SystemConfig::getInstance()->LOOP_DELAY);
+}
+
+// ===== MAIN MENU =====
+void showMainMenu() {
+    currentState = IDLE;
+    bool wifiConnected = wifiController->isWiFiConnected();
+    int deviceCount = deviceController->getDeviceCount();
+    bool alexaActive = alexaController->isAlexaInitialized();
     
-    delay(LOOP_DELAY);
+    serialController->printMainMenu(wifiConnected, deviceCount, alexaActive);
+    serialController->promptMenuOption();
 }
 
-// ===== INIZIALIZZAZIONE =====
-void printWelcome() {
-    Serial.println("\n🚀 ESP32 Bridge per Alexa - Refactored");
-    Serial.println("========================================");
-    Serial.printf("🔧 Max dispositivi: %d\n", MAX_DEVICES);
-    Serial.printf("📡 Target ESP: %s\n", ESP_ORIGINALE_IP);
-    Serial.printf("🏗️  Architettura: Modulare OOP\n");
-}
-
-void initializeSystem() {
-    preferences.begin(PREFERENCES_NAMESPACE, false);
-    deviceManager.loadDevices();
-}
-
-// ===== GESTIONE INPUT SERIALE =====
+// ===== SERIAL INPUT HANDLING =====
 void handleSerialInput() {
-    // ✅ NUOVO: Gestione input seriale senza timeout - await pulito
     if (Serial.available()) {
         char c = Serial.read();
         
@@ -111,10 +133,9 @@ void handleSerialInput() {
             }
         } else if (c >= 32 && c <= 126) {
             inputBuffer += c;
-            if (inputBuffer.length() > MAX_INPUT_LENGTH) {
+            if (inputBuffer.length() > SystemConfig::getInstance()->MAX_INPUT_LENGTH) {
                 inputBuffer = "";
-                Serial.println("❌ Input troppo lungo");
-                // Rimani nello stesso stato, non tornare al menu
+                serialController->println("❌ Input troppo lungo");
                 if (currentState != IDLE) {
                     Serial.print("👉 ");
                 }
@@ -123,373 +144,284 @@ void handleSerialInput() {
     }
 }
 
-void processInput(String input) {
-    input.trim();
+void processInput(const String& input) {
+    String trimmedInput = input;
+    trimmedInput.trim();
     
     switch (currentState) {
         case IDLE:
-            handleMainCommand(input);
+            handleMainCommand(trimmedInput);
             break;
         case WAITING_WIFI_SELECTION:
-            if (wifiManager.handleNetworkSelection(input)) {
-                // Configurazione completata o annullata
-                resetSerialState();
+            // Fix: Gestione corretta degli stati WiFi
+            if (wifiController->handleNetworkSelection(trimmedInput)) {
+                // Configurazione completata (connesso o annullato)
+                if (wifiController->isWiFiConnected() && deviceController->getDeviceCount() > 0) {
+                    alexaController->initialize();
+                }
                 showMainMenu();
             } else {
-                // Aspetta password
-                currentState = WAITING_WIFI_PASSWORD;
+                // Se non è completato, verifica se è in attesa di password
+                if (wifiController->isConfiguring()) {
+                    currentState = WAITING_WIFI_PASSWORD;
+                } else {
+                    // Errore nella selezione, continua a chiedere
+                    // Lo stato rimane WAITING_WIFI_SELECTION
+                }
             }
             break;
         case WAITING_WIFI_PASSWORD:
-            if (wifiManager.handlePasswordInput(input)) {
-                // Configurazione completata
-                if (wifiManager.isWiFiConnected() && deviceManager.getDeviceCount() > 0) {
-                    alexaManager.initialize();
+            if (wifiController->handlePasswordInput(trimmedInput)) {
+                if (wifiController->isWiFiConnected() && deviceController->getDeviceCount() > 0) {
+                    alexaController->initialize();
                 }
-                resetSerialState();
                 showMainMenu();
             }
-            // Altrimenti continua ad aspettare password
+            // Se fallisce, rimane in WAITING_WIFI_PASSWORD per riprovare
+            break;
+        case WAITING_DEVICE_NAME:
+            handleDeviceNameInput(trimmedInput);
             break;
         case WAITING_DEVICE_TYPE:
-            handleDeviceType(input);
+            handleDeviceTypeInput(trimmedInput);
             break;
         case WAITING_DEVICE_PIN:
-            handleDevicePin(input);
+            handleDevicePinInput(trimmedInput);
             break;
         case WAITING_DEVICE_URL:
-            handleDeviceURL(input);
-            break;
-        case WAITING_RESET_CONFIRM:
-            handleResetConfirm(input);
+            handleDeviceURLInput(trimmedInput);
             break;
         case WAITING_DEVICE_REMOVE:
-            handleDeviceRemove(input);
+            handleDeviceRemoveInput(trimmedInput);
+            break;
+        case WAITING_RESET_CONFIRM:
+            handleResetConfirmInput(trimmedInput);
             break;
     }
-}
-
-void resetSerialState() {
-    currentState = IDLE;
-    pendingDeviceName = "";
-}
-
-void startSerialInput(SerialState newState) {
-    currentState = newState;
-}
-
-// ===== MENU PRINCIPALE =====
-void showMainMenu() {
-    resetSerialState();
-    
-    Serial.println("\n╔═══════════════════════════════════════╗");
-    Serial.println("║      🏠 ESP32 BRIDGE ALEXA v2.0       ║");
-    Serial.println("╠═══════════════════════════════════════╣");
-    Serial.printf("║ WiFi: %-31s ║\n", wifiManager.isWiFiConnected() ? "✅ Connesso" : "❌ Disconnesso");
-    Serial.printf("║ Dispositivi: %2d/%-3d                  ║\n", deviceManager.getDeviceCount(), MAX_DEVICES);
-    Serial.printf("║ Alexa: %-30s ║\n", alexaManager.isAlexaInitialized() ? "✅ Attivo" : "❌ Non attivo");
-    Serial.println("╠═══════════════════════════════════════╣");
-    Serial.println("║  1. 📱 Mostra dispositivi             ║");
-    Serial.println("║  2. ➕ Aggiungi dispositivo           ║");
-    Serial.println("║  3. 🗑️  Rimuovi dispositivo            ║");
-    Serial.println("║  4. 📡 Configura WiFi                 ║");
-    Serial.println("║  5. 📊 Status sistema                 ║");
-    Serial.println("║  6. 🔄 Reset configurazione           ║");
-    Serial.println("║  7. 🎤 Riavvia Alexa                  ║");
-    Serial.println("║  0. 👋 Modalità silenziosa            ║");
-    Serial.println("╚═══════════════════════════════════════╝");
-    Serial.print("👉 Scegli opzione (0-7): ");
 }
 
 void handleMainCommand(const String& input) {
     int choice = input.toInt();
     
-    if (choice < MENU_MIN_OPTION || choice > MENU_MAX_OPTION - 1) {
-        Serial.println("❌ Opzione non valida! Scegli 0-7");
-        delay(MENU_RETURN_DELAY);
-        showMainMenu();
-        return;
-    }
-    
     switch (choice) {
-        case 1:
-            deviceManager.printDevices();
+        case 0: // Modalità silenziosa
+            serialController->println("ℹ️ Modalità silenziosa. Digita qualsiasi numero per menu.");
+            return;
+        case 1: // Mostra dispositivi
+            deviceController->printDevices();
             break;
-        case 2:
-            startAddDevice();
+        case 2: // Aggiungi dispositivo
+            handleDeviceAdd();
             return;
-        case 3:
-            startRemoveDevice();
+        case 3: // Rimuovi dispositivo
+            handleDeviceRemove();
             return;
-        case 4:
-            wifiManager.startConfiguration();
+        case 4: // Configura WiFi
+            wifiController->startConfiguration();
             currentState = WAITING_WIFI_SELECTION;
             return;
-        case 5:
+        case 5: // Status sistema
             showSystemStatus();
             break;
-        case 6:
-            startResetConfiguration();
+        case 6: // Reset configurazione
+            handleReset();
             return;
-        case 7:
-            restartAlexa();
-            break;
-        case 0:
-            Serial.println("👋 Modalità silenziosa. Digita qualsiasi numero per menu.");
-            return;
-    }
-    
-    delay(MENU_RETURN_DELAY);
-    showMainMenu();
-}
-
-// ===== GESTIONE DISPOSITIVI =====
-void startAddDevice() {
-    if (deviceManager.isFull()) {
-        Serial.printf("❌ Limite massimo dispositivi raggiunto (%d)\n", MAX_DEVICES);
-        delay(MENU_RETURN_DELAY);
-        showMainMenu();
-        return;
-    }
-    
-    Serial.println("\n➕ Inserisci nome del nuovo dispositivo:");
-    Serial.print("👉 ");
-    pendingDeviceName = "";
-    startSerialInput(WAITING_DEVICE_TYPE);
-}
-
-void startRemoveDevice() {
-    if (deviceManager.getDeviceCount() == 0) {
-        Serial.println("❌ Nessun dispositivo da rimuovere");
-        delay(MENU_RETURN_DELAY);
-        showMainMenu();
-        return;
-    }
-    
-    Serial.println("\n🗑️ Dispositivi disponibili:");
-    deviceManager.printDevices();
-    Serial.print("👉 Nome dispositivo da rimuovere (0=annulla): ");
-    
-    // ✅ NUOVO: Usa stato seriale invece di waitForSerialInput()
-    startSerialInput(WAITING_DEVICE_REMOVE);
-}
-
-void handleDeviceRemove(const String& input) {
-    String deviceName = input;
-    deviceName.trim();
-    
-    if (deviceName == "0") {
-        Serial.println("❌ Rimozione annullata");
-        resetSerialState();
-        showMainMenu();
-        return;
-    }
-    
-    if (deviceName.length() > 0) {
-        if (deviceManager.removeDevice(deviceName)) {
-            Serial.println("✅ Dispositivo '" + deviceName + "' rimosso");
-            if (wifiManager.isWiFiConnected()) {
-                alexaManager.restart();
+        case 7: // Riavvia Alexa
+            if (wifiController->isWiFiConnected() && deviceController->getDeviceCount() > 0) {
+                alexaController->restart();
+            } else {
+                serialController->println("❌ WiFi non connesso o nessun dispositivo");
             }
-        } else {
-            Serial.println("❌ Dispositivo non trovato");
-        }
+            break;
+        default:
+            serialController->println("❌ Opzione non valida! Scegli 0-7");
+            break;
     }
     
-    delay(MENU_RETURN_DELAY);
+    delay(SystemConfig::getInstance()->MENU_RETURN_DELAY);
     showMainMenu();
 }
 
-// ===== STATUS SISTEMA =====
-void showSystemStatus() {
-    Serial.println("\n📊 Status Sistema Modulare:");
-    Serial.println("==============================");
-    
-    // WiFi Status
-    Serial.printf("🌐 WiFi: %s\n", wifiManager.isWiFiConnected() ? "✅ Connesso" : "❌ Disconnesso");
-    if (wifiManager.isWiFiConnected()) {
-        Serial.printf("   SSID: %s\n", wifiManager.getSSID().c_str());
-        Serial.printf("   IP: %s\n", wifiManager.getIP().c_str());
-        Serial.printf("   RSSI: %d dBm\n", wifiManager.getRSSI());
-        Serial.printf("   MAC: %s\n", wifiManager.getMAC().c_str());
-    }
-    
-    // Alexa Status  
-    Serial.printf("🎤 Alexa: %s\n", alexaManager.isAlexaInitialized() ? "✅ Attivo" : "❌ Non attivo");
-    
-    // Device Status
-    Serial.printf("📱 Dispositivi: %d/%d\n", deviceManager.getDeviceCount(), MAX_DEVICES);
-    
-    // System Status
-    Serial.printf("💾 Memoria libera: %d KB\n", ESP.getFreeHeap() / 1024);
-    Serial.printf("⏱️  Uptime: %lu secondi\n", millis() / 1000);
-    Serial.printf("📡 Target ESP: %s\n", ESP_ORIGINALE_IP);
-    Serial.printf("🏗️  Architettura: Modulare OOP\n");
-}
-
-// ===== GESTIONE AGGIUNTA DISPOSITIVI =====
-void handleDeviceType(const String& input) {
-    // Se pendingDeviceName è vuoto, questo è il nome del dispositivo
-    if (pendingDeviceName.length() == 0) {
-        String name = input;
-        name.trim();
-        
-        if (name.length() == 0) {
-            Serial.println("❌ Nome vuoto! Riprova:");
-            Serial.print("👉 ");
-            return;
-        }
-        
-        if (name == "0") {
-            Serial.println("❌ Aggiunta annullata");
-            resetSerialState();
-            showMainMenu();
-            return;
-        }
-        
-        if (deviceManager.deviceExists(name)) {
-            Serial.println("❌ Dispositivo esistente! Riprova:");
-            Serial.print("👉 ");
-            return;
-        }
-        
-        pendingDeviceName = name;
-        Serial.println("✅ Nome: " + name);
-        Serial.println("🔧 Tipo controllo:");
-        Serial.println("   1. Standard (Pin ESP)");
-        Serial.println("   2. Custom (URL)");
-        Serial.println("   0. Annulla");
-        Serial.print("👉 Scegli (1/2/0): ");
+// ===== DEVICE MANAGEMENT =====
+void handleDeviceAdd() {
+    if (deviceController->isFull()) {
+        serialController->printf("❌ Limite massimo dispositivi raggiunto (%d)\n", SystemConfig::getInstance()->MAX_DEVICES);
+        delay(SystemConfig::getInstance()->MENU_RETURN_DELAY);
+        showMainMenu();
         return;
     }
     
-    // Gestione tipo dispositivo
+    serialController->promptDeviceName();
+    pendingDeviceName = "";
+    currentState = WAITING_DEVICE_NAME;
+}
+
+void handleDeviceNameInput(const String& input) {
+    if (input == "0") {
+        serialController->println("ℹ️ Aggiunta annullata");
+        showMainMenu();
+        return;
+    }
+    
+    if (input.length() == 0) {
+        serialController->println("❌ Nome vuoto! Riprova:");
+        serialController->promptDeviceName();
+        return;
+    }
+    
+    if (deviceController->deviceExists(input)) {
+        serialController->println("❌ Dispositivo esistente! Riprova:");
+        serialController->promptDeviceName();
+        return;
+    }
+    
+    pendingDeviceName = input;
+    serialController->printf("✅ Nome: %s\n", input.c_str());
+    serialController->promptDeviceType();
+    currentState = WAITING_DEVICE_TYPE;
+}
+
+void handleDeviceTypeInput(const String& input) {
     int choice = input.toInt();
     
     switch (choice) {
         case 0:
-            Serial.println("❌ Aggiunta annullata");
-            resetSerialState();
+            serialController->println("ℹ️ Aggiunta annullata");
             showMainMenu();
             break;
         case 1:
-            Serial.printf("📍 Pin ESP32 (%d-%d) o 0 per annullare: ", ESP32_MIN_PIN, ESP32_MAX_PIN);
-            startSerialInput(WAITING_DEVICE_PIN);
+            serialController->promptDevicePin(SystemConfig::getInstance()->ESP32_MIN_PIN, SystemConfig::getInstance()->ESP32_MAX_PIN);
+            currentState = WAITING_DEVICE_PIN;
             break;
         case 2:
-            Serial.print("🌐 URL completo o 0 per annullare: ");
-            startSerialInput(WAITING_DEVICE_URL);
+            serialController->promptDeviceURL();
+            currentState = WAITING_DEVICE_URL;
             break;
         default:
-            Serial.println("❌ Scelta non valida! Riprova (1/2/0):");
-            Serial.print("👉 ");
+            serialController->println("❌ Scelta non valida! Riprova (1/2/0):");
+            serialController->promptDeviceType();
             break;
     }
 }
 
-void handleDevicePin(const String& input) {
+void handleDevicePinInput(const String& input) {
     if (input == "0") {
-        Serial.println("❌ Aggiunta annullata");
-        resetSerialState();
+        serialController->println("ℹ️ Aggiunta annullata");
         showMainMenu();
         return;
     }
     
     int pin = input.toInt();
-    if (pin < ESP32_MIN_PIN || pin > ESP32_MAX_PIN) {
-        Serial.printf("❌ Pin non valido (%d-%d)! Riprova:\n", ESP32_MIN_PIN, ESP32_MAX_PIN);
-        Serial.print("👉 ");
+    SystemConfig* config = SystemConfig::getInstance();
+    
+    if (pin < config->ESP32_MIN_PIN || pin > config->ESP32_MAX_PIN) {
+        serialController->printf("❌ Pin non valido (%d-%d)! Riprova:\n", config->ESP32_MIN_PIN, config->ESP32_MAX_PIN);
+        serialController->promptDevicePin(config->ESP32_MIN_PIN, config->ESP32_MAX_PIN);
         return;
     }
     
-    if (deviceManager.addDevice(pendingDeviceName, pin)) {
-        Serial.printf("✅ '%s' configurato per pin %d\n", pendingDeviceName.c_str(), pin);
-        
-        if (wifiManager.isWiFiConnected()) {
-            alexaManager.restart();
+    if (deviceController->addDevice(pendingDeviceName, pin)) {
+        serialController->printf("✅ '%s' configurato per pin %d\n", pendingDeviceName.c_str(), pin);
+        if (wifiController->isWiFiConnected()) {
+            alexaController->restart();
         }
-    } else {
-        Serial.println("❌ Errore aggiunta dispositivo");
     }
     
-    resetSerialState();
-    delay(MENU_RETURN_DELAY);
+    delay(config->MENU_RETURN_DELAY);
     showMainMenu();
 }
 
-void handleDeviceURL(const String& input) {
+void handleDeviceURLInput(const String& input) {
     if (input == "0") {
-        Serial.println("❌ Aggiunta annullata");
-        resetSerialState();
+        serialController->println("ℹ️ Aggiunta annullata");
         showMainMenu();
         return;
     }
     
-    String url = input;
-    url.trim();
-    
-    if (url.length() == 0 || !url.startsWith("http")) {
-        Serial.println("❌ URL non valido (deve iniziare con http)! Riprova:");
-        Serial.print("👉 ");
+    if (input.length() == 0 || !input.startsWith("http")) {
+        serialController->println("❌ URL non valido (deve iniziare con http)! Riprova:");
+        serialController->promptDeviceURL();
         return;
     }
     
-    if (deviceManager.addDevice(pendingDeviceName, url)) {
-        Serial.printf("✅ '%s' configurato per URL: %s\n", pendingDeviceName.c_str(), url.c_str());
-        
-        if (wifiManager.isWiFiConnected()) {
-            alexaManager.restart();
+    if (deviceController->addDevice(pendingDeviceName, input)) {
+        serialController->printf("✅ '%s' configurato per URL: %s\n", pendingDeviceName.c_str(), input.c_str());
+        if (wifiController->isWiFiConnected()) {
+            alexaController->restart();
         }
-    } else {
-        Serial.println("❌ Errore aggiunta dispositivo");
     }
     
-    resetSerialState();
-    delay(MENU_RETURN_DELAY);
+    delay(SystemConfig::getInstance()->MENU_RETURN_DELAY);
     showMainMenu();
 }
 
-// ===== RESET CONFIGURAZIONE =====
-void startResetConfiguration() {
-    Serial.println("⚠️  RESET COMPLETO CONFIGURAZIONE!");
-    Serial.println("Verranno cancellati WiFi e tutti i dispositivi.");
-    Serial.println("Confermi? (y/N/0=annulla):");
-    Serial.print("👉 ");
-    startSerialInput(WAITING_RESET_CONFIRM);
+void handleDeviceRemove() {
+    if (deviceController->getDeviceCount() == 0) {
+        serialController->println("❌ Nessun dispositivo da rimuovere");
+        delay(SystemConfig::getInstance()->MENU_RETURN_DELAY);
+        showMainMenu();
+        return;
+    }
+    
+    deviceController->printDevices();
+    serialController->promptRemoveDevice();
+    currentState = WAITING_DEVICE_REMOVE;
 }
 
-void handleResetConfirm(const String& input) {
+void handleDeviceRemoveInput(const String& input) {
+    if (input == "0") {
+        serialController->println("ℹ️ Rimozione annullata");
+        showMainMenu();
+        return;
+    }
+    
+    if (deviceController->removeDevice(input)) {
+        if (wifiController->isWiFiConnected()) {
+            alexaController->restart();
+        }
+    }
+    
+    delay(SystemConfig::getInstance()->MENU_RETURN_DELAY);
+    showMainMenu();
+}
+
+// ===== SYSTEM STATUS =====
+void showSystemStatus() {
+    String ssid = wifiController->getSSID();
+    String ip = wifiController->getIP();
+    int rssi = wifiController->getRSSI();
+    String mac = wifiController->getMAC();
+    int deviceCount = deviceController->getDeviceCount();
+    bool alexaActive = alexaController->isAlexaInitialized();
+    
+    serialController->printSystemStatus(ssid, ip, rssi, mac, deviceCount, alexaActive, millis());
+}
+
+// ===== RESET SYSTEM =====
+void handleReset() {
+    serialController->promptResetConfirm();
+    currentState = WAITING_RESET_CONFIRM;
+}
+
+void handleResetConfirmInput(const String& input) {
     String choice = input;
     choice.toLowerCase();
     
     if (choice == "y" || choice == "yes") {
-        Serial.println("🔄 Reset in corso...");
+        serialController->println("🔄 Reset in corso...");
         
-        // Reset completo modularizzato
-        alexaManager.shutdown();
-        wifiManager.disconnect();
+        alexaController->shutdown();
+        wifiController->disconnect();
         preferences.clear();
-        deviceManager.clear();
+        deviceController->clear();
         
-        Serial.println("✅ Reset completato!");
-        Serial.println("🔄 Riavvia ESP per riconfigurare");
-        
-        resetSerialState();
-        Serial.println("👋 Sistema in modalità silenziosa.");
+        serialController->println("✅ Reset completato!");
+        serialController->println("🔄 Riavvia ESP per riconfigurare");
+        serialController->println("👋 Sistema in modalità silenziosa.");
         return;
     } else {
-        Serial.println("❌ Reset annullato");
-        resetSerialState();
-        delay(MENU_RETURN_DELAY);
+        serialController->println("ℹ️ Reset annullato");
+        delay(SystemConfig::getInstance()->MENU_RETURN_DELAY);
         showMainMenu();
-    }
-}
-
-void restartAlexa() {
-    if (wifiManager.isWiFiConnected() && deviceManager.getDeviceCount() > 0) {
-        alexaManager.restart();
-        Serial.println("✅ Alexa riavviato");
-    } else {
-        Serial.println("❌ WiFi non connesso o nessun dispositivo");
     }
 }
